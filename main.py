@@ -5,7 +5,7 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
-from google import genai # 新しいライブラリのインポート
+from google import genai
 
 # ==========================================
 # 1. 設定情報の準備（環境変数より取得）
@@ -16,7 +16,7 @@ CHATWORK_ROOM_ID = os.environ.get("CHATWORK_ROOM_ID")
 SPREADSHEET_ID = "1ySo2dw6sFk467Wi9cDgwfU47xYm8LU94RzfAUxtOGf8"
 
 # ==========================================
-# 2. Gemini API (新 SDK) の初期設定
+# 2. Gemini API (新 SDK: google-genai) の初期設定
 # ==========================================
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -41,9 +41,11 @@ def get_search_conditions():
     
     conditions = []
     for row in records[1:]:
+        # 「ボツ」の行が出現したら読み込み終了
         if not row or row[0] == 'ボツ' or (len(row) > 3 and row[3] == 'ボツ'):
             break
         
+        # D列にテキストが入っているか確認
         if len(row) > 3 and row[3] and row[3] not in ['金額', '依頼内容']:
             towns = [t.strip().lstrip('-').strip() for t in re.split(r'[\n,、・]', row[3]) if t.strip()]
             valid_towns = [t for t in towns if "指定なし" not in t and "情報が不足" not in t]
@@ -68,6 +70,7 @@ def fetch_suumo_data():
         )
         page = context.new_page()
         
+        # SUUMO 兵庫県姫路市の土地・新着順ページ
         target_url = "https://suumo.jp/jj/bukken/ichiran/JJ010001/?ar=060&bs=030&ta=28&sc=28201&srz=01"
         
         print(f"SUUMOへアクセス中: {target_url}")
@@ -109,9 +112,8 @@ def analyze_with_gemini(raw_text, conditions):
 ]
 """
     try:
-        # 新しい SDK (google-genai) での呼び出し形式
         response = client.models.generate_content(
-            model='gemini-2.5-flash', # 新世代モデルを指定
+            model='gemini-2.5-flash',
             contents=prompt
         )
         
@@ -155,29 +157,23 @@ def send_chatwork(property_data):
 def main():
     print("--- 処理を開始します ---")
     
-    # 接続動作確認用テスト通知（確認後に不要であれば消してください）
-    send_chatwork({
-        "townName": "システムテスト",
-        "client": "管理者",
-        "title": "GitHub Actions接続テストメッセージ",
-        "price": "-",
-        "address": "-",
-        "url": "https://github.com"
-    })
-    
+    # 1. スプレッドシートから条件を取得
     conditions = get_search_conditions()
     print(f"スプレッドシートから取得した条件数: {len(conditions)}件")
     if not conditions:
         print("処理対象の条件がないため終了します。")
         return
 
+    # 2. SUUMOから最新のテキストデータを取得
     raw_text, base_url = fetch_suumo_data()
     print("SUUMOからのデータ取得が完了しました。")
 
+    # 3. Gemini API で条件照合と解析を実行
     print("Gemini API (AI) によるデータ解析を実行中...")
     matched_properties = analyze_with_gemini(raw_text, conditions)
     print(f"AIが条件一致と判定した物件数: {len(matched_properties)}件")
 
+    # 4. マッチした物件を送信
     for prop in matched_properties:
         if not prop.get("url"):
             prop["url"] = base_url
