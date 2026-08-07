@@ -17,7 +17,7 @@ CHATWORK_ROOM_ID = os.environ.get("CHATWORK_ROOM_ID")
 SPREADSHEET_ID = "1ySo2dw6sFk467Wi9cDgwfU47xYm8LU94RzfAUxtOGf8"
 
 # ==========================================
-# 2. Gemini API (新 SDK) の初期設定
+# 2. Gemini API (新 SDK: google-genai) の初期設定
 # ==========================================
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -46,6 +46,7 @@ def get_search_conditions():
             break
         
         if len(row) > 3 and row[3] and row[3] not in ['金額', '依頼内容']:
+            # カンマ、読点、改行、中黒などで分割
             towns = [t.strip().lstrip('-').strip() for t in re.split(r'[\n,、・]', row[3]) if t.strip()]
             valid_towns = [t for t in towns if "指定なし" not in t and "情報が不足" not in t]
             
@@ -58,13 +59,13 @@ def get_search_conditions():
 
 
 # ==========================================
-# 4. ポータルサイトからのスクレイピング関数
+# 4. ポータルサイトからの効率的なスクレイピング関数
 # ==========================================
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def fetch_site_data(site_name, url):
-    """Playwrightを使って指定されたURLからテキストデータを取得"""
+    """Playwrightを使って指定されたURLから【物件情報枠のみ】のテキストを効率的に取得"""
     print(f"[{site_name}] アクセス中: {url}")
     try:
         with sync_playwright() as p:
@@ -73,7 +74,23 @@ def fetch_site_data(site_name, url):
             page = context.new_page()
             
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page_text = page.locator("body").inner_text()
+            
+            # ポータルサイトごとの物件カード要素セレクタ（ヘッダーやフッターを除外するため）
+            selectors = {
+                "SUUMO": ".cassetteitem, .property_unit, .l-cassettebody",
+                "アットホーム": ".item-list, .property-card, .object-item",
+                "LIFULL HOME'S": ".mod-mergeBuildingList, .module-property, .property-item"
+            }
+            
+            target_selector = selectors.get(site_name, "body")
+            elements = page.locator(target_selector).all()
+            
+            # 物件要素が存在すればそれらだけを結合、見つからなければ全画面テキストを取得
+            if elements:
+                page_text = "\n--- 物件区切り ---\n".join([el.inner_text() for el in elements])
+            else:
+                page_text = page.locator("body").inner_text()
+                
             browser.close()
             return page_text, url
     except Exception as e:
@@ -82,14 +99,13 @@ def fetch_site_data(site_name, url):
 
 
 # ==========================================
-# 5. Gemini API による解析関数（1日以内フィルター対応）
+# 5. Gemini API による解析関数（表記揺れ吸収 ＆ 35,000文字対応）
 # ==========================================
 def analyze_with_gemini(site_name, raw_text, conditions):
-    """取得した画面テキストと依頼条件を Gemini API に渡し、1日以内に公開・更新された物件のみ抽出"""
+    """取得した画面テキストと依頼条件を Gemini API に渡し、表記揺れを考慮して1日以内の物件を抽出"""
     if not raw_text:
         return []
         
-    # 本日と昨日の日付を取得
     today = datetime.now()
     yesterday = today - timedelta(days=1)
     
@@ -107,13 +123,20 @@ def analyze_with_gemini(site_name, raw_text, conditions):
 {json.dumps(conditions, ensure_ascii=False)}
 
 【Webサイトテキストデータ】:
-{raw_text[:12000]}
+{raw_text[:35000]}
 
-【抽出・厳密ルール】:
-1. テキスト内に条件に含まれる町名（例: 飾磨区、勝原区、大津区など）が記載されていること。
-2. 物件の「公開日」「登録日」「更新日」「掲載日」が【本日 ({today_str})】または【昨日 ({yesterday_str})】に該当するもの、もしくは「本日掲載」「昨日掲載」「新着」などの表記があるものだけを抽出してください。
-3. 公開日・更新日が2日以上前の明確な日付が記載されている物件は絶対に除外してください。
-4. 必ず以下のJSON配列フォーマットのみで出力してください。該当がなければ [] を返してください。
+【判定ルール（表記揺れの吸収と厳密判定）】:
+1. **町名キーワードのマッチング（柔軟対応）**:
+   - スプレッドシート側の「飾磨区中地」に対して、Webサイト側の表記が「姫路市中地」「中地」「中地１丁目」「中地一丁目」などであっても同一地域と判定してください。
+   - 「〇〇区」の有無、全角・半角数字の違い、漢数字（1丁目/一丁目）の違いを吸収して一致を判定してください。
+   - 条件に指定された町名のいずれか1つでも含まれていれば対象とします。
+
+2. **日付の厳密判定**:
+   - 物件の「公開日」「登録日」「更新日」「掲載日」が【本日 ({today_str})】または【昨日 ({yesterday_str})】に該当するもの、もしくは「新着」「本日公開」「昨日公開」などの表記があるものを抽出してください。
+   - 明らかに2日以上前に掲載された明確な過去日付の物件は除外してください。
+
+3. **出力フォーマット**:
+   - 必ず以下のJSON配列フォーマットのみで出力してください。該当がなければ [] を返してください。
 
 [
   {{
