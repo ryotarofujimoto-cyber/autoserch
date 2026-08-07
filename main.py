@@ -16,7 +16,7 @@ CHATWORK_ROOM_ID = os.environ.get("CHATWORK_ROOM_ID")
 SPREADSHEET_ID = "1ySo2dw6sFk467Wi9cDgwfU47xYm8LU94RzfAUxtOGf8"
 
 # ==========================================
-# 2. Gemini API (新 SDK: google-genai) の初期設定
+# 2. Gemini API (新 SDK) の初期設定
 # ==========================================
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -41,11 +41,9 @@ def get_search_conditions():
     
     conditions = []
     for row in records[1:]:
-        # 「ボツ」の行が出現したら読み込み終了
         if not row or row[0] == 'ボツ' or (len(row) > 3 and row[3] == 'ボツ'):
             break
         
-        # D列にテキストが入っているか確認
         if len(row) > 3 and row[3] and row[3] not in ['金額', '依頼内容']:
             towns = [t.strip().lstrip('-').strip() for t in re.split(r'[\n,、・]', row[3]) if t.strip()]
             valid_towns = [t for t in towns if "指定なし" not in t and "情報が不足" not in t]
@@ -59,35 +57,39 @@ def get_search_conditions():
 
 
 # ==========================================
-# 4. Playwrightでポータルサイト(SUUMO)の画面テキストを取得する関数
+# 4. 各ポータルサイトからのスクレイピング関数
 # ==========================================
-def fetch_suumo_data():
-    """裏でブラウザを起動し、SUUMOの姫路市新着土地一覧からテキストを取得"""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
-        
-        # SUUMO 兵庫県姫路市の土地・新着順ページ
-        target_url = "https://suumo.jp/jj/bukken/ichiran/JJ010001/?ar=060&bs=030&ta=28&sc=28201&srz=01"
-        
-        print(f"SUUMOへアクセス中: {target_url}")
-        page.goto(target_url, wait_until="domcontentloaded")
-        
-        page_text = page.locator("body").inner_text()
-        browser.close()
-        return page_text, target_url
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+def fetch_site_data(site_name, url):
+    """Playwrightを使って指定されたURLからテキストデータを取得"""
+    print(f"[{site_name}] アクセス中: {url}")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(user_agent=USER_AGENT)
+            page = context.new_page()
+            
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page_text = page.locator("body").inner_text()
+            browser.close()
+            return page_text, url
+    except Exception as e:
+        print(f"[{site_name}] 取得エラー: {e}")
+        return "", url
 
 
 # ==========================================
-# 5. Gemini API (新 SDK) に物件の判定を行わせる関数
+# 5. Gemini API による解析関数
 # ==========================================
-def analyze_with_gemini(raw_text, conditions):
+def analyze_with_gemini(site_name, raw_text, conditions):
     """取得した画面テキストと依頼条件を Gemini API に渡し、合致物件を抽出"""
+    if not raw_text:
+        return []
+        
     prompt = f"""
-以下のWebサイトテキストから、指定された【町名キーワード】が含まれる物件情報を抽出してください。
+以下のWebサイト（サイト名: {site_name}）のテキストから、指定された【町名キーワード】が含まれる物件情報を抽出してください。
 
 【町名キーワード条件】:
 {json.dumps(conditions, ensure_ascii=False)}
@@ -102,6 +104,7 @@ def analyze_with_gemini(raw_text, conditions):
 
 [
   {{
+    "siteName": "{site_name}",
     "townName": "一致した町名",
     "client": "依頼者名",
     "title": "物件名",
@@ -112,7 +115,6 @@ def analyze_with_gemini(raw_text, conditions):
 ]
 """
     try:
-        # 常に最新の安定版を参照するエイリアスを使用
         response = client.models.generate_content(
             model='gemini-flash-latest',
             contents=prompt
@@ -123,7 +125,7 @@ def analyze_with_gemini(raw_text, conditions):
             return json.loads(match.group(0))
         return []
     except Exception as e:
-        print(f"AI解析エラー: {e}")
+        print(f"[{site_name}] AI解析エラー: {e}")
         return []
 
 
@@ -139,8 +141,10 @@ def send_chatwork(property_data):
     url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
     headers = {"X-ChatWorkToken": CHATWORK_TOKEN}
     
+    site_name = property_data.get("siteName", "ポータル")
     body_text = (
-        f"[info][title]🏠 【AI検知】新着物件通知 ({property_data.get('townName', '地域')})[/title]"
+        f"[info][title]🏠 【AI検知】新着物件通知 [{site_name}] ({property_data.get('townName', '地域')})[/title]"
+        f"■ 掲載サイト: {site_name}\n"
         f"■ 依頼者/担当: {property_data.get('client', '未指定')}\n"
         f"■ 物件名: {property_data.get('title', '名称不明')}\n"
         f"■ 価格: {property_data.get('price', '要確認')}\n"
@@ -149,7 +153,7 @@ def send_chatwork(property_data):
     )
     
     res = requests.post(url, headers=headers, data={"body": body_text})
-    print(f"Chatwork送信結果 ({property_data.get('townName')}): ステータスコード {res.status_code}")
+    print(f"Chatwork送信結果 [{site_name}] ({property_data.get('townName')}): ステータスコード {res.status_code}")
 
 
 # ==========================================
@@ -165,22 +169,44 @@ def main():
         print("処理対象の条件がないため終了します。")
         return
 
-    # 2. SUUMOから最新のテキストデータを取得
-    raw_text, base_url = fetch_suumo_data()
-    print("SUUMOからのデータ取得が完了しました。")
+    # 2. 巡回対象のポータルサイトURL一覧（姫路市の土地新着一覧）
+    targets = [
+        {
+            "name": "SUUMO",
+            "url": "https://suumo.jp/jj/bukken/ichiran/JJ010001/?ar=060&bs=030&ta=28&sc=28201&srz=01"
+        },
+        {
+            "name": "アットホーム",
+            "url": "https://www.athome.co.jp/tochi/hyogo/himeji-city/list/?sort=1"
+        },
+        {
+            "name": "LIFULL HOME'S",
+            "url": "https://www.homes.co.jp/tochi/hyogo/himeji-city/list/?sort=registered_date"
+        }
+    ]
 
-    # 3. Gemini API で条件照合と解析を実行
-    print("Gemini API (AI) によるデータ解析を実行中...")
-    matched_properties = analyze_with_gemini(raw_text, conditions)
-    print(f"AIが条件一致と判定した物件数: {len(matched_properties)}件")
+    # 3. 各サイトを巡回して解析＆通知
+    total_matches = 0
+    for target in targets:
+        site_name = target["name"]
+        site_url = target["url"]
+        
+        raw_text, base_url = fetch_site_data(site_name, site_url)
+        if not raw_text:
+            continue
+            
+        print(f"[{site_name}] Gemini API (AI) による解析を実行中...")
+        matched_properties = analyze_with_gemini(site_name, raw_text, conditions)
+        print(f"[{site_name}] 条件一致件数: {len(matched_properties)}件")
+        
+        total_matches += len(matched_properties)
+        
+        for prop in matched_properties:
+            if not prop.get("url") or prop.get("url") == "URL":
+                prop["url"] = base_url
+            send_chatwork(prop)
 
-    # 4. マッチした物件を送信
-    for prop in matched_properties:
-        if not prop.get("url"):
-            prop["url"] = base_url
-        send_chatwork(prop)
-
-    print("--- すべての処理が完了しました ---")
+    print(f"--- すべての処理が完了しました（合計検出数: {total_matches}件） ---")
 
 
 if __name__ == "__main__":
