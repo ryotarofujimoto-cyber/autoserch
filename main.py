@@ -112,8 +112,9 @@ def analyze_with_gemini(raw_text, conditions):
 ]
 """
     try:
+        # 常に最新の安定版を参照するエイリアスを使用
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-flash-latest',
             contents=prompt
         )
         
