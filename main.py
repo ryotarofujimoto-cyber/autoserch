@@ -3,6 +3,7 @@ import json
 import re
 import requests
 import gspread
+from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
 from google import genai
@@ -57,7 +58,7 @@ def get_search_conditions():
 
 
 # ==========================================
-# 4. 各ポータルサイトからのスクレイピング関数
+# 4. ポータルサイトからのスクレイピング関数
 # ==========================================
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -81,15 +82,26 @@ def fetch_site_data(site_name, url):
 
 
 # ==========================================
-# 5. Gemini API による解析関数
+# 5. Gemini API による解析関数（1日以内フィルター対応）
 # ==========================================
 def analyze_with_gemini(site_name, raw_text, conditions):
-    """取得した画面テキストと依頼条件を Gemini API に渡し、合致物件を抽出"""
+    """取得した画面テキストと依頼条件を Gemini API に渡し、1日以内に公開・更新された物件のみ抽出"""
     if not raw_text:
         return []
         
+    # 本日と昨日の日付を取得
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    
+    today_str = today.strftime("%Y年%m月%d日")
+    yesterday_str = yesterday.strftime("%Y年%m月%d日")
+
     prompt = f"""
-以下のWebサイト（サイト名: {site_name}）のテキストから、指定された【町名キーワード】が含まれる物件情報を抽出してください。
+以下のWebサイト（サイト名: {site_name}）のテキストから、指定された【町名キーワード】が含まれ、かつ【情報公開日・更新日・登録日】が「1日以内（本日または昨日）」の物件情報のみを抽出してください。
+
+【基準日時】:
+- 本日: {today_str}
+- 昨日: {yesterday_str}
 
 【町名キーワード条件】:
 {json.dumps(conditions, ensure_ascii=False)}
@@ -97,10 +109,11 @@ def analyze_with_gemini(site_name, raw_text, conditions):
 【Webサイトテキストデータ】:
 {raw_text[:12000]}
 
-【抽出ルール】:
-- テキスト内に条件に含まれる町名（例: 飾磨区、勝原区、大津区など）が記載されている物件を見つけてください。
-- 条件に少しでも当てはまれば抽出対象としてください。
-- 必ず以下のJSON配列フォーマットのみで出力してください。該当がなければ [] を返してください。
+【抽出・厳密ルール】:
+1. テキスト内に条件に含まれる町名（例: 飾磨区、勝原区、大津区など）が記載されていること。
+2. 物件の「公開日」「登録日」「更新日」「掲載日」が【本日 ({today_str})】または【昨日 ({yesterday_str})】に該当するもの、もしくは「本日掲載」「昨日掲載」「新着」などの表記があるものだけを抽出してください。
+3. 公開日・更新日が2日以上前の明確な日付が記載されている物件は絶対に除外してください。
+4. 必ず以下のJSON配列フォーマットのみで出力してください。該当がなければ [] を返してください。
 
 [
   {{
@@ -110,6 +123,7 @@ def analyze_with_gemini(site_name, raw_text, conditions):
     "title": "物件名",
     "price": "価格",
     "address": "住所",
+    "publishedDate": "公開日または更新日",
     "url": "URL"
   }}
 ]
@@ -142,9 +156,12 @@ def send_chatwork(property_data):
     headers = {"X-ChatWorkToken": CHATWORK_TOKEN}
     
     site_name = property_data.get("siteName", "ポータル")
+    pub_date = property_data.get("publishedDate", "直近1日以内")
+    
     body_text = (
         f"[info][title]🏠 【AI検知】新着物件通知 [{site_name}] ({property_data.get('townName', '地域')})[/title]"
         f"■ 掲載サイト: {site_name}\n"
+        f"■ 公開/更新: {pub_date}\n"
         f"■ 依頼者/担当: {property_data.get('client', '未指定')}\n"
         f"■ 物件名: {property_data.get('title', '名称不明')}\n"
         f"■ 価格: {property_data.get('price', '要確認')}\n"
@@ -169,7 +186,7 @@ def main():
         print("処理対象の条件がないため終了します。")
         return
 
-    # 2. 巡回対象のポータルサイトURL一覧（姫路市の土地新着一覧）
+    # 2. 巡回対象のポータルサイトURL一覧（姫路市の土地新着順）
     targets = [
         {
             "name": "SUUMO",
